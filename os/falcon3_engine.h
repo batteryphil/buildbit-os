@@ -182,20 +182,22 @@ static const char *g_f3_opencl_shaders =
 "    }\n"
 "}\n"
 "\n"
-"/* 1. Token Embedding Lookup (BF16 -> FP32 in VRAM) */\n"
+"/* 1. Token Embedding Lookup (BF16 -> FP32 in VRAM, Supports Direct GPU-Resident Token Chaining!) */\n"
 "__kernel void k_embed_lookup(\n"
 "    __global const ushort * restrict st_u16,\n"
 "    __global float        * restrict x,\n"
 "    const ulong embed_u16_off,\n"
-"    const int token_id\n"
+"    const int token_id,\n"
+"    __global const int    * restrict d_best_id\n"
 ") {\n"
 "    int i = get_global_id(0);\n"
 "    if (i < 3072) {\n"
-"        x[i] = bf16_to_f32(st_u16[embed_u16_off + (ulong)token_id * 3072UL + (ulong)i]);\n"
+"        int tok = (token_id >= 0) ? token_id : d_best_id[0];\n"
+"        x[i] = bf16_to_f32(st_u16[embed_u16_off + (ulong)tok * 3072UL + (ulong)i]);\n"
 "    }\n"
 "}\n"
 "\n"
-"/* 2. Fused Wave32 RMSNorm + Symmetric INT8 Activation Quantization + Sum Reduction */\n"
+"/* 2. Single-Pass Register-Cached float4 Wave32 RMSNorm + INT8 Quantization (2 Barriers Total!) */\n"
 "inline float wave32_max_f32(float x) {\n"
 "    float m = sub_group_reduce_max(x);\n"
 "    __asm__ volatile(\"\" : \"+v\"(m));\n"
@@ -204,69 +206,91 @@ static const char *g_f3_opencl_shaders =
 "\n"
 "__kernel __attribute__((reqd_work_group_size(256, 1, 1)))\n"
 "void k_rmsnorm_and_quant(\n"
-"    __global const float  * restrict x,\n"
+"    __global const float4 * restrict x4,\n"
 "    __global const ushort * restrict st_u16,\n"
 "    const ulong norm_u16_off,\n"
-"    __global char         * restrict xq,\n"
+"    __global char4        * restrict xq4,\n"
 "    __global float        * restrict out_scale,\n"
-"    __global int          * restrict out_sum_xq,\n"
-"    const int dim\n"
+"    __global int          * restrict out_sum_xq\n"
 ") {\n"
-"    __local float l_f[8];\n"
-"    __local int   l_i[8];\n"
-"    __local float l_scalar;\n"
+"    __local float l_ss[8];\n"
+"    __local float l_max[8];\n"
+"    __local int   l_sum[8];\n"
+"    __local float l_inv_rms;\n"
+"    __local float l_scale;\n"
 "    int lid  = get_local_id(0);\n"
 "    int wid  = lid >> 5;\n"
 "    int wlid = lid & 31;\n"
 "\n"
+"    __global const ushort *nw = st_u16 + norm_u16_off;\n"
+"    float4 x0, x1, x2, w0, w1, w2;\n"
 "    float ss = 0.0f;\n"
-"    for (int i = lid; i < dim; i += 256) {\n"
-"        float v = x[i];\n"
-"        ss += v * v;\n"
-"    }\n"
-"    ss = wave32_sum_f32(ss);\n"
-"    if (wlid == 0) l_f[wid] = ss;\n"
-"    barrier(CLK_LOCAL_MEM_FENCE);\n"
-"    if (lid == 0) {\n"
-"        float tot = l_f[0]+l_f[1]+l_f[2]+l_f[3]+l_f[4]+l_f[5]+l_f[6]+l_f[7];\n"
-"        l_scalar = rsqrt(tot / (float)dim + 1e-6f);\n"
-"    }\n"
-"    barrier(CLK_LOCAL_MEM_FENCE);\n"
-"    float inv_rms = l_scalar;\n"
+"    float max_u = 0.0f;\n"
 "\n"
-"    float max_abs = 1e-5f;\n"
-"    for (int i = lid; i < dim; i += 256) {\n"
-"        float vn = (x[i] * inv_rms) * bf16_to_f32(st_u16[norm_u16_off + (ulong)i]);\n"
-"        max_abs = fmax(max_abs, fabs(vn));\n"
+"    #define LOAD_NORM4(idx4, dx, dw) do { \\\n"
+"        float4 xv = x4[idx4]; \\\n"
+"        ss += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w); \\\n"
+"        int b = (idx4) << 2; \\\n"
+"        float4 wv = (float4)(bf16_to_f32(nw[b+0]), bf16_to_f32(nw[b+1]), \\\n"
+"                             bf16_to_f32(nw[b+2]), bf16_to_f32(nw[b+3])); \\\n"
+"        dx = xv; dw = wv; \\\n"
+"        float4 au = fabs(xv * wv); \\\n"
+"        max_u = fmax(max_u, fmax(fmax(au.x, au.y), fmax(au.z, au.w))); \\\n"
+"    } while (0)\n"
+"\n"
+"    LOAD_NORM4(lid,       x0, w0);\n"
+"    LOAD_NORM4(lid + 256, x1, w1);\n"
+"    LOAD_NORM4(lid + 512, x2, w2);\n"
+"    #undef LOAD_NORM4\n"
+"\n"
+"    ss    = wave32_sum_f32(ss);\n"
+"    max_u = wave32_max_f32(max_u);\n"
+"    if (wlid == 0) {\n"
+"        l_ss[wid]  = ss;\n"
+"        l_max[wid] = max_u;\n"
 "    }\n"
-"    max_abs = wave32_max_f32(max_abs);\n"
-"    if (wlid == 0) l_f[wid] = max_abs;\n"
 "    barrier(CLK_LOCAL_MEM_FENCE);\n"
 "    if (lid == 0) {\n"
-"        float m = fmax(fmax(fmax(l_f[0], l_f[1]), fmax(l_f[2], l_f[3])),\n"
-"                       fmax(fmax(l_f[4], l_f[5]), fmax(l_f[6], l_f[7])));\n"
-"        l_scalar = 127.0f / m;\n"
+"        float tot_ss  = l_ss[0]+l_ss[1]+l_ss[2]+l_ss[3]+l_ss[4]+l_ss[5]+l_ss[6]+l_ss[7];\n"
+"        float inv_rms = rsqrt(tot_ss * (1.0f / 3072.0f) + 1e-6f);\n"
+"        float m_u = fmax(fmax(fmax(l_max[0], l_max[1]), fmax(l_max[2], l_max[3])),\n"
+"                         fmax(fmax(l_max[4], l_max[5]), fmax(l_max[6], l_max[7])));\n"
+"        float scale  = 127.0f / fmax(m_u * inv_rms, 1e-5f);\n"
+"        out_scale[0] = scale;\n"
+"        l_inv_rms    = inv_rms;\n"
+"        l_scale      = scale;\n"
 "    }\n"
 "    barrier(CLK_LOCAL_MEM_FENCE);\n"
-"    float scale = l_scalar;\n"
+"    float inv_rms = l_inv_rms;\n"
+"    float scale   = l_scale;\n"
 "\n"
 "    int sq = 0;\n"
-"    for (int i = lid; i < dim; i += 256) {\n"
-"        float vn = (x[i] * inv_rms) * bf16_to_f32(st_u16[norm_u16_off + (ulong)i]);\n"
-"        int q = (int)clamp(rint(vn * scale), -128.0f, 127.0f);\n"
-"        xq[i] = (char)q;\n"
-"        sq += q;\n"
-"    }\n"
+"    #define QUANT_U4(idx4, xv, wv) do { \\\n"
+"        float4 nv = (xv * inv_rms) * wv; \\\n"
+"        __asm__ volatile(\"\" : \"+v\"(nv)); \\\n"
+"        float4 vs = nv * scale; \\\n"
+"        int q0 = (int)clamp(rint(vs.x), -128.0f, 127.0f); \\\n"
+"        int q1 = (int)clamp(rint(vs.y), -128.0f, 127.0f); \\\n"
+"        int q2 = (int)clamp(rint(vs.z), -128.0f, 127.0f); \\\n"
+"        int q3 = (int)clamp(rint(vs.w), -128.0f, 127.0f); \\\n"
+"        xq4[idx4] = (char4)((char)q0, (char)q1, (char)q2, (char)q3); \\\n"
+"        sq += q0 + q1 + q2 + q3; \\\n"
+"    } while (0)\n"
+"\n"
+"    QUANT_U4(lid,       x0, w0);\n"
+"    QUANT_U4(lid + 256, x1, w1);\n"
+"    QUANT_U4(lid + 512, x2, w2);\n"
+"    #undef QUANT_U4\n"
+"\n"
 "    sq = wave32_sum_i32(sq);\n"
-"    if (wlid == 0) l_i[wid] = sq;\n"
+"    if (wlid == 0) l_sum[wid] = sq;\n"
 "    barrier(CLK_LOCAL_MEM_FENCE);\n"
 "    if (lid == 0) {\n"
-"        out_scale[0]  = scale;\n"
-"        out_sum_xq[0] = l_i[0]+l_i[1]+l_i[2]+l_i[3]+l_i[4]+l_i[5]+l_i[6]+l_i[7];\n"
+"        out_sum_xq[0] = l_sum[0]+l_sum[1]+l_sum[2]+l_sum[3]+l_sum[4]+l_sum[5]+l_sum[6]+l_sum[7];\n"
 "    }\n"
 "}\n"
 "\n"
-"/* 3. Vectorized float4 Wave32 Symmetric INT8 Activation Quantization (Attn_Out & SwiGLU) */\n"
+"/* 3. Vectorized float4 Wave32 Symmetric INT8 Activation Quantization (23,040-dim SwiGLU) */\n"
 "__kernel __attribute__((reqd_work_group_size(256, 1, 1)))\n"
 "void k_quant_only(\n"
 "    __global const float4 * restrict x4,\n"
@@ -283,9 +307,18 @@ static const char *g_f3_opencl_shaders =
 "    int wlid = lid & 31;\n"
 "    int dim4 = dim >> 2;\n"
 "    float max_abs = 1e-5f;\n"
-"    for (int i = lid; i < dim4; i += 256) {\n"
-"        float4 v = fabs(x4[i]);\n"
-"        max_abs = fmax(max_abs, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));\n"
+"    float4 r0, r1, r2;\n"
+"    if (dim4 == 768) {\n"
+"        r0 = x4[lid]; r1 = x4[lid + 256]; r2 = x4[lid + 512];\n"
+"        float4 a0 = fabs(r0), a1 = fabs(r1), a2 = fabs(r2);\n"
+"        max_abs = fmax(max_abs, fmax(fmax(a0.x, a0.y), fmax(a0.z, a0.w)));\n"
+"        max_abs = fmax(max_abs, fmax(fmax(a1.x, a1.y), fmax(a1.z, a1.w)));\n"
+"        max_abs = fmax(max_abs, fmax(fmax(a2.x, a2.y), fmax(a2.z, a2.w)));\n"
+"    } else {\n"
+"        for (int i = lid; i < dim4; i += 256) {\n"
+"            float4 v = fabs(x4[i]);\n"
+"            max_abs = fmax(max_abs, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));\n"
+"        }\n"
 "    }\n"
 "    max_abs = wave32_max_f32(max_abs);\n"
 "    if (wlid == 0) l_f[wid] = max_abs;\n"
@@ -298,14 +331,30 @@ static const char *g_f3_opencl_shaders =
 "    barrier(CLK_LOCAL_MEM_FENCE);\n"
 "    float scale = l_scale;\n"
 "    int sq = 0;\n"
-"    for (int i = lid; i < dim4; i += 256) {\n"
-"        float4 v = x4[i] * scale;\n"
-"        int q0 = (int)clamp(rint(v.x), -128.0f, 127.0f);\n"
-"        int q1 = (int)clamp(rint(v.y), -128.0f, 127.0f);\n"
-"        int q2 = (int)clamp(rint(v.z), -128.0f, 127.0f);\n"
-"        int q3 = (int)clamp(rint(v.w), -128.0f, 127.0f);\n"
-"        xq4[i] = (char4)((char)q0, (char)q1, (char)q2, (char)q3);\n"
-"        sq += q0 + q1 + q2 + q3;\n"
+"    if (dim4 == 768) {\n"
+"        #define Q_R4(idx4, rv) do { \\\n"
+"            float4 v = (rv) * scale; \\\n"
+"            int q0 = (int)clamp(rint(v.x), -128.0f, 127.0f); \\\n"
+"            int q1 = (int)clamp(rint(v.y), -128.0f, 127.0f); \\\n"
+"            int q2 = (int)clamp(rint(v.z), -128.0f, 127.0f); \\\n"
+"            int q3 = (int)clamp(rint(v.w), -128.0f, 127.0f); \\\n"
+"            xq4[idx4] = (char4)((char)q0, (char)q1, (char)q2, (char)q3); \\\n"
+"            sq += q0 + q1 + q2 + q3; \\\n"
+"        } while (0)\n"
+"        Q_R4(lid,       r0);\n"
+"        Q_R4(lid + 256, r1);\n"
+"        Q_R4(lid + 512, r2);\n"
+"        #undef Q_R4\n"
+"    } else {\n"
+"        for (int i = lid; i < dim4; i += 256) {\n"
+"            float4 v = x4[i] * scale;\n"
+"            int q0 = (int)clamp(rint(v.x), -128.0f, 127.0f);\n"
+"            int q1 = (int)clamp(rint(v.y), -128.0f, 127.0f);\n"
+"            int q2 = (int)clamp(rint(v.z), -128.0f, 127.0f);\n"
+"            int q3 = (int)clamp(rint(v.w), -128.0f, 127.0f);\n"
+"            xq4[i] = (char4)((char)q0, (char)q1, (char)q2, (char)q3);\n"
+"            sq += q0 + q1 + q2 + q3;\n"
+"        }\n"
 "    }\n"
 "    sq = wave32_sum_i32(sq);\n"
 "    if (wlid == 0) l_i[wid] = sq;\n"
@@ -316,41 +365,25 @@ static const char *g_f3_opencl_shaders =
 "    }\n"
 "}\n"
 "\n"
-"/* 4a. Fused Q + K + V Wave32 2-Row-Pack SWAR Kernel (3 Projections in 1 Launch/Layer!) */\n"
+"/* 4a. Overflow-Free Wave32 2-Row-Pack SWAR Kernel for 3,072-Dim Projections (Q, K, V, O)! */\n"
 "__kernel __attribute__((reqd_work_group_size(32, 1, 1)))\n"
-"void k_falcon3_qkv_swar_2rp(\n"
-"    __global const uint4 * restrict w_buf,\n"
-"    const ulong q_u128_off,\n"
-"    const ulong k_u128_off,\n"
-"    const ulong v_u128_off,\n"
-"    const float inv_q_scale,\n"
-"    const float inv_k_scale,\n"
-"    const float inv_v_scale,\n"
+"void k_falcon3_ternary_3072_2rp(\n"
+"    __global const uint4 * restrict st_u128,\n"
+"    const ulong w_u128_off,\n"
+"    const float inv_w_scale,\n"
 "    __global const int4  * restrict xq_vec,\n"
 "    __global const float * restrict d_x_scale,\n"
 "    __global const int   * restrict d_sum_xq,\n"
-"    __global float       * restrict d_q,\n"
-"    __global float       * restrict d_k_cache,\n"
-"    __global float       * restrict d_v_cache,\n"
-"    const ulong kv_slot_off\n"
+"    __global float       * restrict out_base,\n"
+"    const ulong out_float_off,\n"
+"    const int r_packs,\n"
+"    const int add_residual\n"
 ") {\n"
-"    int gid = get_group_id(0); /* 0..639: 0..383=Q (768 rp), 384..511=K (256 rp), 512..639=V (256 rp) */\n"
+"    int rp2 = get_group_id(0) * 2;\n"
 "    int lid = get_local_id(0);\n"
-"    ulong w_u128_off;\n"
-"    float inv_w_scale;\n"
-"    __global float *out;\n"
-"    int rp2, r_packs;\n"
-"    if (gid < 384) {\n"
-"        rp2 = gid * 2; r_packs = 768;\n"
-"        w_u128_off = q_u128_off; inv_w_scale = inv_q_scale; out = d_q;\n"
-"    } else if (gid < 512) {\n"
-"        rp2 = (gid - 384) * 2; r_packs = 256;\n"
-"        w_u128_off = k_u128_off; inv_w_scale = inv_k_scale; out = d_k_cache + kv_slot_off;\n"
-"    } else {\n"
-"        rp2 = (gid - 512) * 2; r_packs = 256;\n"
-"        w_u128_off = v_u128_off; inv_w_scale = inv_v_scale; out = d_v_cache + kv_slot_off;\n"
-"    }\n"
-"    __global const uint4 *w_row0 = w_buf + w_u128_off + (ulong)(rp2 + 0) * 192UL;\n"
+"    if (rp2 >= r_packs) return;\n"
+"\n"
+"    __global const uint4 *w_row0 = st_u128 + w_u128_off + (ulong)(rp2 + 0) * 192UL;\n"
 "    __global const uint4 *w_row1 = w_row0 + 192UL;\n"
 "    int a02 = 0, a13 = 0, b02 = 0, b13 = 0;\n"
 "    #pragma nounroll\n"
@@ -395,95 +428,6 @@ static const char *g_f3_opencl_shaders =
 "    sum2 = wave32_sum_i32(sum2); sum3 = wave32_sum_i32(sum3);\n"
 "    sum4 = wave32_sum_i32(sum4); sum5 = wave32_sum_i32(sum5);\n"
 "    sum6 = wave32_sum_i32(sum6); sum7 = wave32_sum_i32(sum7);\n"
-"    if (lid == 0) {\n"
-"        int sum_xq = d_sum_xq[0];\n"
-"        float inv_scale = inv_w_scale / d_x_scale[0];\n"
-"        int rp_a = rp2 + 0, rp_b = rp2 + 1;\n"
-"        out[rp_a + 0 * r_packs] = (float)(sum0 - sum_xq) * inv_scale;\n"
-"        out[rp_a + 1 * r_packs] = (float)(sum1 - sum_xq) * inv_scale;\n"
-"        out[rp_a + 2 * r_packs] = (float)(sum2 - sum_xq) * inv_scale;\n"
-"        out[rp_a + 3 * r_packs] = (float)(sum3 - sum_xq) * inv_scale;\n"
-"        out[rp_b + 0 * r_packs] = (float)(sum4 - sum_xq) * inv_scale;\n"
-"        out[rp_b + 1 * r_packs] = (float)(sum5 - sum_xq) * inv_scale;\n"
-"        out[rp_b + 2 * r_packs] = (float)(sum6 - sum_xq) * inv_scale;\n"
-"        out[rp_b + 3 * r_packs] = (float)(sum7 - sum_xq) * inv_scale;\n"
-"    }\n"
-"}\n"
-"\n"
-"/* 4b. Wave32 2-Row-Pack (8 Rows/Wave32) Pre-Swizzled 16-Bit SWAR Ternary GEMV Kernel! */\n"
-"__kernel __attribute__((reqd_work_group_size(32, 1, 1)))\n"
-"void k_falcon3_ternary_swar_2rp(\n"
-"    __global const uint4 * restrict st_u128,\n"
-"    const ulong w_u128_off,\n"
-"    const float inv_w_scale,\n"
-"    __global const int4  * restrict xq_vec,\n"
-"    __global const float * restrict d_x_scale,\n"
-"    __global const int   * restrict d_sum_xq,\n"
-"    __global float       * restrict out_base,\n"
-"    const ulong out_float_off,\n"
-"    const int in_u128,\n"
-"    const int r_packs,\n"
-"    const int add_residual\n"
-") {\n"
-"    int rp2 = get_group_id(0) * 2;\n"
-"    int lid = get_local_id(0);\n"
-"    if (rp2 >= r_packs) return;\n"
-"\n"
-"    __global const uint4 *w_row0 = st_u128 + w_u128_off + (ulong)(rp2 + 0) * (ulong)in_u128;\n"
-"    __global const uint4 *w_row1 = w_row0 + (ulong)in_u128;\n"
-"    int sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;\n"
-"    int sum4 = 0, sum5 = 0, sum6 = 0, sum7 = 0;\n"
-"    int a02 = 0, a13 = 0, b02 = 0, b13 = 0;\n"
-"    int step = 0;\n"
-"    #pragma nounroll\n"
-"    for (int c = lid; c < in_u128; c += 32) {\n"
-"        uint4 wv0 = w_row0[c];\n"
-"        uint4 wv1 = w_row1[c];\n"
-"        int4  xv  = xq_vec[c];\n"
-"        uint wa[4] = { wv0.x, wv0.y, wv0.z, wv0.w };\n"
-"        uint wb[4] = { wv1.x, wv1.y, wv1.z, wv1.w };\n"
-"        int  xa[4] = { xv.x,  xv.y,  xv.z,  xv.w  };\n"
-"        #pragma unroll\n"
-"        for (int k = 0; k < 4; k++) {\n"
-"            uint w0 = wa[k], w1 = wb[k];\n"
-"            int  x  = xa[k];\n"
-"            int x0 = amd_bfe(x, 0u, 8u);\n"
-"            int x1 = amd_bfe(x, 8u, 8u);\n"
-"            int x2 = amd_bfe(x, 16u, 8u);\n"
-"            int x3 = amd_bfe(x, 24u, 8u);\n"
-"            a02 = mad24((int)(w0 & 0x00030003u),         x0, a02);\n"
-"            a13 = mad24((int)((w0 >> 2) & 0x00030003u),  x0, a13);\n"
-"            b02 = mad24((int)(w1 & 0x00030003u),         x0, b02);\n"
-"            b13 = mad24((int)((w1 >> 2) & 0x00030003u),  x0, b13);\n"
-"            a02 = mad24((int)((w0 >> 4) & 0x00030003u),  x1, a02);\n"
-"            a13 = mad24((int)((w0 >> 6) & 0x00030003u),  x1, a13);\n"
-"            b02 = mad24((int)((w1 >> 4) & 0x00030003u),  x1, b02);\n"
-"            b13 = mad24((int)((w1 >> 6) & 0x00030003u),  x1, b13);\n"
-"            a02 = mad24((int)((w0 >> 8) & 0x00030003u),  x2, a02);\n"
-"            a13 = mad24((int)((w0 >> 10) & 0x00030003u), x2, a13);\n"
-"            b02 = mad24((int)((w1 >> 8) & 0x00030003u),  x2, b02);\n"
-"            b13 = mad24((int)((w1 >> 10) & 0x00030003u), x2, b13);\n"
-"            a02 = mad24((int)((w0 >> 12) & 0x00030003u), x3, a02);\n"
-"            a13 = mad24((int)((w0 >> 14) & 0x00030003u), x3, a13);\n"
-"            b02 = mad24((int)((w1 >> 12) & 0x00030003u), x3, b02);\n"
-"            b13 = mad24((int)((w1 >> 14) & 0x00030003u), x3, b13);\n"
-"        }\n"
-"        if ((++step & 3) == 0) {\n"
-"            int t0 = (short)(a02 & 0xFFFF); sum0 += t0; sum2 += (a02 - t0) >> 16; a02 = 0;\n"
-"            int t1 = (short)(a13 & 0xFFFF); sum1 += t1; sum3 += (a13 - t1) >> 16; a13 = 0;\n"
-"            int t4 = (short)(b02 & 0xFFFF); sum4 += t4; sum6 += (b02 - t4) >> 16; b02 = 0;\n"
-"            int t5 = (short)(b13 & 0xFFFF); sum5 += t5; sum7 += (b13 - t5) >> 16; b13 = 0;\n"
-"        }\n"
-"    }\n"
-"    int t0 = (short)(a02 & 0xFFFF); sum0 += t0; sum2 += (a02 - t0) >> 16;\n"
-"    int t1 = (short)(a13 & 0xFFFF); sum1 += t1; sum3 += (a13 - t1) >> 16;\n"
-"    int t4 = (short)(b02 & 0xFFFF); sum4 += t4; sum6 += (b02 - t4) >> 16;\n"
-"    int t5 = (short)(b13 & 0xFFFF); sum5 += t5; sum7 += (b13 - t5) >> 16;\n"
-"\n"
-"    sum0 = wave32_sum_i32(sum0); sum1 = wave32_sum_i32(sum1);\n"
-"    sum2 = wave32_sum_i32(sum2); sum3 = wave32_sum_i32(sum3);\n"
-"    sum4 = wave32_sum_i32(sum4); sum5 = wave32_sum_i32(sum5);\n"
-"    sum6 = wave32_sum_i32(sum6); sum7 = wave32_sum_i32(sum7);\n"
 "\n"
 "    if (lid == 0) {\n"
 "        __global float *out = out_base + out_float_off;\n"
@@ -509,6 +453,87 @@ static const char *g_f3_opencl_shaders =
 "            out[rp_b + 0 * r_packs] = v4; out[rp_b + 1 * r_packs] = v5;\n"
 "            out[rp_b + 2 * r_packs] = v6; out[rp_b + 3 * r_packs] = v7;\n"
 "        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* 4b. Branchless-Block Wave32 2-Row-Pack SWAR Kernel for 23,040-Dim Down_Proj! */\n"
+"__kernel __attribute__((reqd_work_group_size(32, 1, 1)))\n"
+"void k_falcon3_down_swar_2rp(\n"
+"    __global const uint4 * restrict st_u128,\n"
+"    const ulong w_u128_off,\n"
+"    const float inv_w_scale,\n"
+"    __global const int4  * restrict xq_vec,\n"
+"    __global const float * restrict d_x_scale,\n"
+"    __global const int   * restrict d_sum_xq,\n"
+"    __global float       * restrict out_x\n"
+") {\n"
+"    int rp2 = get_group_id(0) * 2; /* 0..766 step 2 */\n"
+"    int lid = get_local_id(0);     /* 0..31 */\n"
+"\n"
+"    __global const uint4 *w_row0 = st_u128 + w_u128_off + (ulong)(rp2 + 0) * 1440UL;\n"
+"    __global const uint4 *w_row1 = w_row0 + 1440UL;\n"
+"    int sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;\n"
+"    int sum4 = 0, sum5 = 0, sum6 = 0, sum7 = 0;\n"
+"    #pragma nounroll\n"
+"    for (int c_base = lid; c_base < 1440; c_base += 192) {\n"
+"        int a02 = 0, a13 = 0, b02 = 0, b13 = 0;\n"
+"        int c_end = min(c_base + 192, 1440);\n"
+"        #pragma nounroll\n"
+"        for (int c = c_base; c < c_end; c += 32) {\n"
+"            uint4 wv0 = w_row0[c];\n"
+"            uint4 wv1 = w_row1[c];\n"
+"            int4  xv  = xq_vec[c];\n"
+"            uint wa[4] = { wv0.x, wv0.y, wv0.z, wv0.w };\n"
+"            uint wb[4] = { wv1.x, wv1.y, wv1.z, wv1.w };\n"
+"            int  xa[4] = { xv.x,  xv.y,  xv.z,  xv.w  };\n"
+"            #pragma unroll\n"
+"            for (int k = 0; k < 4; k++) {\n"
+"                uint w0 = wa[k], w1 = wb[k];\n"
+"                int  x  = xa[k];\n"
+"                int x0 = amd_bfe(x, 0u, 8u);\n"
+"                int x1 = amd_bfe(x, 8u, 8u);\n"
+"                int x2 = amd_bfe(x, 16u, 8u);\n"
+"                int x3 = amd_bfe(x, 24u, 8u);\n"
+"                a02 = mad24((int)(w0 & 0x00030003u),         x0, a02);\n"
+"                a13 = mad24((int)((w0 >> 2) & 0x00030003u),  x0, a13);\n"
+"                b02 = mad24((int)(w1 & 0x00030003u),         x0, b02);\n"
+"                b13 = mad24((int)((w1 >> 2) & 0x00030003u),  x0, b13);\n"
+"                a02 = mad24((int)((w0 >> 4) & 0x00030003u),  x1, a02);\n"
+"                a13 = mad24((int)((w0 >> 6) & 0x00030003u),  x1, a13);\n"
+"                b02 = mad24((int)((w1 >> 4) & 0x00030003u),  x1, b02);\n"
+"                b13 = mad24((int)((w1 >> 6) & 0x00030003u),  x1, b13);\n"
+"                a02 = mad24((int)((w0 >> 8) & 0x00030003u),  x2, a02);\n"
+"                a13 = mad24((int)((w0 >> 10) & 0x00030003u), x2, a13);\n"
+"                b02 = mad24((int)((w1 >> 8) & 0x00030003u),  x2, b02);\n"
+"                b13 = mad24((int)((w1 >> 10) & 0x00030003u), x2, b13);\n"
+"                a02 = mad24((int)((w0 >> 12) & 0x00030003u), x3, a02);\n"
+"                a13 = mad24((int)((w0 >> 14) & 0x00030003u), x3, a13);\n"
+"                b02 = mad24((int)((w1 >> 12) & 0x00030003u), x3, b02);\n"
+"                b13 = mad24((int)((w1 >> 14) & 0x00030003u), x3, b13);\n"
+"            }\n"
+"        }\n"
+"        int t0 = (short)(a02 & 0xFFFF); sum0 += t0; sum2 += (a02 - t0) >> 16;\n"
+"        int t1 = (short)(a13 & 0xFFFF); sum1 += t1; sum3 += (a13 - t1) >> 16;\n"
+"        int t4 = (short)(b02 & 0xFFFF); sum4 += t4; sum6 += (b02 - t4) >> 16;\n"
+"        int t5 = (short)(b13 & 0xFFFF); sum5 += t5; sum7 += (b13 - t5) >> 16;\n"
+"    }\n"
+"    sum0 = wave32_sum_i32(sum0); sum1 = wave32_sum_i32(sum1);\n"
+"    sum2 = wave32_sum_i32(sum2); sum3 = wave32_sum_i32(sum3);\n"
+"    sum4 = wave32_sum_i32(sum4); sum5 = wave32_sum_i32(sum5);\n"
+"    sum6 = wave32_sum_i32(sum6); sum7 = wave32_sum_i32(sum7);\n"
+"\n"
+"    if (lid == 0) {\n"
+"        int sum_xq = d_sum_xq[0];\n"
+"        float inv_scale = inv_w_scale / d_x_scale[0];\n"
+"        int rp_a = rp2 + 0, rp_b = rp2 + 1;\n"
+"        out_x[rp_a + 0 * 768] += (float)(sum0 - sum_xq) * inv_scale;\n"
+"        out_x[rp_a + 1 * 768] += (float)(sum1 - sum_xq) * inv_scale;\n"
+"        out_x[rp_a + 2 * 768] += (float)(sum2 - sum_xq) * inv_scale;\n"
+"        out_x[rp_a + 3 * 768] += (float)(sum3 - sum_xq) * inv_scale;\n"
+"        out_x[rp_b + 0 * 768] += (float)(sum4 - sum_xq) * inv_scale;\n"
+"        out_x[rp_b + 1 * 768] += (float)(sum5 - sum_xq) * inv_scale;\n"
+"        out_x[rp_b + 2 * 768] += (float)(sum6 - sum_xq) * inv_scale;\n"
+"        out_x[rp_b + 3 * 768] += (float)(sum7 - sum_xq) * inv_scale;\n"
 "    }\n"
 "}\n"
 "\n"
@@ -589,8 +614,8 @@ static const char *g_f3_opencl_shaders =
 "    }\n"
 "}\n"
 "\n"
-"/* 6. Fused Multi-Query RoPE + Grouped-Query Attention (4 KV Workgroups x 3 Q Heads) */\n"
-"__kernel __attribute__((reqd_work_group_size(128, 1, 1)))\n"
+"/* 6. 8-Way Time-Parallel Wave32 Multi-Query RoPE + GQA (4 Workgroups x 8 Wave32s, 0 Loop Barriers!) */\n"
+"__kernel __attribute__((reqd_work_group_size(256, 1, 1)))\n"
 "void k_fused_rope_gqa(\n"
 "    __global const float * restrict q,\n"
 "    __global float       * restrict k_cache,\n"
@@ -599,58 +624,86 @@ static const char *g_f3_opencl_shaders =
 "    const int layer,\n"
 "    const int pos\n"
 ") {\n"
-"    int kv_h = get_group_id(0); /* 0..3 (each workgroup computes 3 Q heads sharing kv_h!) */\n"
-"    int lid  = get_local_id(0); /* 0..127 */\n"
-"    int wid  = lid >> 5;        /* 0..3 */\n"
+"    int kv_h = get_group_id(0); /* 0..3 (each workgroup computes 3 Q heads sharing kv_h) */\n"
+"    int lid  = get_local_id(0); /* 0..255 */\n"
+"    int wid  = lid >> 5;        /* 0..7 (8 Wave32s step across time t in parallel!) */\n"
 "    int wlid = lid & 31;        /* 0..31 */\n"
 "\n"
-"    float freq  = exp((float)lid * -0.10793400436f);\n"
-"    float angle = (float)pos * freq;\n"
-"    float cos_a = cos(angle);\n"
-"    float sin_a = sin(angle);\n"
+"    __local float4 l_q0_4[64], l_q1_4[64], l_q2_4[64], l_kr_4[64];\n"
+"    __local float *l_q0 = (__local float *)l_q0_4;\n"
+"    __local float *l_q1 = (__local float *)l_q1_4;\n"
+"    __local float *l_q2 = (__local float *)l_q2_4;\n"
+"    __local float *l_kr = (__local float *)l_kr_4;\n"
+"    __local float  l_s[3][256];\n"
+"    __local float4 l_p0[8][64], l_p1[8][64], l_p2[8][64];\n"
 "\n"
-"    /* Rotate K[pos] in-place for KV head kv_h */\n"
-"    ulong k_pos_off = ((ulong)layer * 256UL + (ulong)pos) * 1024UL + (ulong)(kv_h * 256);\n"
-"    float kp0 = k_cache[k_pos_off + lid];\n"
-"    float kp1 = k_cache[k_pos_off + lid + 128];\n"
-"    float kr0 = kp0 * cos_a - kp1 * sin_a;\n"
-"    float kr1 = kp1 * cos_a + kp0 * sin_a;\n"
-"    k_cache[k_pos_off + lid]       = kr0;\n"
-"    k_cache[k_pos_off + lid + 128] = kr1;\n"
+"    if (lid < 128) {\n"
+"        float angle = (float)pos * exp((float)lid * -0.10793400436f);\n"
+"        float cos_a = cos(angle);\n"
+"        float sin_a = sin(angle);\n"
 "\n"
-"    /* Load and RoPE-rotate all 3 Q heads sharing kv_h purely in registers! */\n"
-"    int q0_idx = (kv_h * 3 + 0) * 256 + lid;\n"
-"    int q1_idx = (kv_h * 3 + 1) * 256 + lid;\n"
-"    int q2_idx = (kv_h * 3 + 2) * 256 + lid;\n"
-"    float qa0 = q[q0_idx], qb0 = q[q0_idx + 128];\n"
-"    float qa1 = q[q1_idx], qb1 = q[q1_idx + 128];\n"
-"    float qa2 = q[q2_idx], qb2 = q[q2_idx + 128];\n"
-"    float q0_0 = qa0 * cos_a - qb0 * sin_a, q0_1 = qb0 * cos_a + qa0 * sin_a;\n"
-"    float q1_0 = qa1 * cos_a - qb1 * sin_a, q1_1 = qb1 * cos_a + qa1 * sin_a;\n"
-"    float q2_0 = qa2 * cos_a - qb2 * sin_a, q2_1 = qb2 * cos_a + qa2 * sin_a;\n"
+"        ulong k_pos_off = ((ulong)layer * 256UL + (ulong)pos) * 1024UL + (ulong)(kv_h * 256);\n"
+"        float kp0 = k_cache[k_pos_off + lid];\n"
+"        float kp1 = k_cache[k_pos_off + lid + 128];\n"
+"        float kr0 = kp0 * cos_a - kp1 * sin_a;\n"
+"        float kr1 = kp1 * cos_a + kp0 * sin_a;\n"
+"        k_cache[k_pos_off + lid]       = kr0;\n"
+"        k_cache[k_pos_off + lid + 128] = kr1;\n"
+"        l_kr[lid]       = kr0;\n"
+"        l_kr[lid + 128] = kr1;\n"
 "\n"
-"    __local float l_w0[4], l_w1[4], l_w2[4];\n"
-"    __local float l_s[3][256];\n"
-"    for (int t = 0; t <= pos; t++) {\n"
-"        ulong kt_off = ((ulong)layer * 256UL + (ulong)t) * 1024UL + (ulong)(kv_h * 256);\n"
-"        float kt0 = (t == pos) ? kr0 : k_cache[kt_off + lid];\n"
-"        float kt1 = (t == pos) ? kr1 : k_cache[kt_off + lid + 128];\n"
-"        float d0 = wave32_sum_f32(q0_0 * kt0 + q0_1 * kt1);\n"
-"        float d1 = wave32_sum_f32(q1_0 * kt0 + q1_1 * kt1);\n"
-"        float d2 = wave32_sum_f32(q2_0 * kt0 + q2_1 * kt1);\n"
-"        if (wlid == 0) { l_w0[wid] = d0; l_w1[wid] = d1; l_w2[wid] = d2; }\n"
-"        barrier(CLK_LOCAL_MEM_FENCE);\n"
-"        if (lid == 0) {\n"
-"            l_s[0][t] = (l_w0[0] + l_w0[1] + l_w0[2] + l_w0[3]) * (1.0f / 16.0f);\n"
-"            l_s[1][t] = (l_w1[0] + l_w1[1] + l_w1[2] + l_w1[3]) * (1.0f / 16.0f);\n"
-"            l_s[2][t] = (l_w2[0] + l_w2[1] + l_w2[2] + l_w2[3]) * (1.0f / 16.0f);\n"
-"        }\n"
-"        barrier(CLK_LOCAL_MEM_FENCE);\n"
+"        int q0_idx = (kv_h * 3 + 0) * 256 + lid;\n"
+"        int q1_idx = (kv_h * 3 + 1) * 256 + lid;\n"
+"        int q2_idx = (kv_h * 3 + 2) * 256 + lid;\n"
+"        float qa0 = q[q0_idx], qb0 = q[q0_idx + 128];\n"
+"        float qa1 = q[q1_idx], qb1 = q[q1_idx + 128];\n"
+"        float qa2 = q[q2_idx], qb2 = q[q2_idx + 128];\n"
+"        l_q0[lid]       = (qa0 * cos_a - qb0 * sin_a) * (1.0f / 16.0f);\n"
+"        l_q0[lid + 128] = (qb0 * cos_a + qa0 * sin_a) * (1.0f / 16.0f);\n"
+"        l_q1[lid]       = (qa1 * cos_a - qb1 * sin_a) * (1.0f / 16.0f);\n"
+"        l_q1[lid + 128] = (qb1 * cos_a + qa1 * sin_a) * (1.0f / 16.0f);\n"
+"        l_q2[lid]       = (qa2 * cos_a - qb2 * sin_a) * (1.0f / 16.0f);\n"
+"        l_q2[lid + 128] = (qb2 * cos_a + qa2 * sin_a) * (1.0f / 16.0f);\n"
 "    }\n"
+"    barrier(CLK_LOCAL_MEM_FENCE);\n"
 "\n"
+"    float4 q0_lo = l_q0_4[wlid], q0_hi = l_q0_4[wlid + 32];\n"
+"    float4 q1_lo = l_q1_4[wlid], q1_hi = l_q1_4[wlid + 32];\n"
+"    float4 q2_lo = l_q2_4[wlid], q2_hi = l_q2_4[wlid + 32];\n"
+"\n"
+"    __global const float4 *k_cache4 = (__global const float4 *)k_cache;\n"
+"    __global const float4 *v_cache4 = (__global const float4 *)v_cache;\n"
+"    ulong kv4_base = (ulong)layer * 256UL * 256UL + (ulong)(kv_h * 64);\n"
+"\n"
+"    /* 8 Wave32s evaluate 8 time steps t in parallel with ZERO barriers inside the loop! */\n"
+"    for (int t = wid; t <= pos; t += 8) {\n"
+"        float4 kt_lo, kt_hi;\n"
+"        if (t == pos) {\n"
+"            kt_lo = l_kr_4[wlid];\n"
+"            kt_hi = l_kr_4[wlid + 32];\n"
+"        } else {\n"
+"            ulong kt4_off = kv4_base + (ulong)t * 256UL;\n"
+"            kt_lo = k_cache4[kt4_off + wlid];\n"
+"            kt_hi = k_cache4[kt4_off + wlid + 32];\n"
+"        }\n"
+"        float4 p0 = q0_lo * kt_lo + q0_hi * kt_hi;\n"
+"        float4 p1 = q1_lo * kt_lo + q1_hi * kt_hi;\n"
+"        float4 p2 = q2_lo * kt_lo + q2_hi * kt_hi;\n"
+"        float s0 = wave32_sum_f32((p0.x + p0.y) + (p0.z + p0.w));\n"
+"        float s1 = wave32_sum_f32((p1.x + p1.y) + (p1.z + p1.w));\n"
+"        float s2 = wave32_sum_f32((p2.x + p2.y) + (p2.z + p2.w));\n"
+"        if (wlid == 0) {\n"
+"            l_s[0][t] = s0;\n"
+"            l_s[1][t] = s1;\n"
+"            l_s[2][t] = s2;\n"
+"        }\n"
+"    }\n"
+"    barrier(CLK_LOCAL_MEM_FENCE);\n"
+"\n"
+"    /* 3-Head Parallel Softmax in LDS (Threads 0, 1, 2 handle Q heads 0, 1, 2 simultaneously!) */\n"
 "    if (lid < 3) {\n"
 "        float m = -1e30f;\n"
-"        for (int t = 0; t <= pos; t++) if (l_s[lid][t] > m) m = l_s[lid][t];\n"
+"        for (int t = 0; t <= pos; t++) m = fmax(m, l_s[lid][t]);\n"
 "        float se = 0.0f;\n"
 "        for (int t = 0; t <= pos; t++) {\n"
 "            float e = exp(l_s[lid][t] - m);\n"
@@ -662,24 +715,38 @@ static const char *g_f3_opencl_shaders =
 "    }\n"
 "    barrier(CLK_LOCAL_MEM_FENCE);\n"
 "\n"
-"    float o0_0 = 0.0f, o0_1 = 0.0f;\n"
-"    float o1_0 = 0.0f, o1_1 = 0.0f;\n"
-"    float o2_0 = 0.0f, o2_1 = 0.0f;\n"
-"    for (int t = 0; t <= pos; t++) {\n"
-"        ulong vt_off = ((ulong)layer * 256UL + (ulong)t) * 1024UL + (ulong)(kv_h * 256);\n"
-"        float vt0 = v_cache[vt_off + lid];\n"
-"        float vt1 = v_cache[vt_off + lid + 128];\n"
+"    /* 8 Wave32s accumulate V[t] across 8 time steps in parallel with ZERO loop barriers! */\n"
+"    float4 o0_lo = (float4)(0.0f), o0_hi = (float4)(0.0f);\n"
+"    float4 o1_lo = (float4)(0.0f), o1_hi = (float4)(0.0f);\n"
+"    float4 o2_lo = (float4)(0.0f), o2_hi = (float4)(0.0f);\n"
+"    for (int t = wid; t <= pos; t += 8) {\n"
+"        ulong vt4_off = kv4_base + (ulong)t * 256UL;\n"
+"        float4 vt_lo = v_cache4[vt4_off + wlid];\n"
+"        float4 vt_hi = v_cache4[vt4_off + wlid + 32];\n"
 "        float w0 = l_s[0][t], w1 = l_s[1][t], w2 = l_s[2][t];\n"
-"        o0_0 += w0 * vt0; o0_1 += w0 * vt1;\n"
-"        o1_0 += w1 * vt0; o1_1 += w1 * vt1;\n"
-"        o2_0 += w2 * vt0; o2_1 += w2 * vt1;\n"
+"        o0_lo += w0 * vt_lo; o0_hi += w0 * vt_hi;\n"
+"        o1_lo += w1 * vt_lo; o1_hi += w1 * vt_hi;\n"
+"        o2_lo += w2 * vt_lo; o2_hi += w2 * vt_hi;\n"
 "    }\n"
-"    attn_out[q0_idx] = o0_0; attn_out[q0_idx + 128] = o0_1;\n"
-"    attn_out[q1_idx] = o1_0; attn_out[q1_idx + 128] = o1_1;\n"
-"    attn_out[q2_idx] = o2_0; attn_out[q2_idx + 128] = o2_1;\n"
+"    l_p0[wid][wlid] = o0_lo; l_p0[wid][wlid + 32] = o0_hi;\n"
+"    l_p1[wid][wlid] = o1_lo; l_p1[wid][wlid + 32] = o1_hi;\n"
+"    l_p2[wid][wlid] = o2_lo; l_p2[wid][wlid + 32] = o2_hi;\n"
+"    barrier(CLK_LOCAL_MEM_FENCE);\n"
+"\n"
+"    __global float4 *ao4 = (__global float4 *)attn_out;\n"
+"    if (wid < 2) {\n"
+"        int c64 = wid * 32 + wlid;\n"
+"        ao4[(kv_h * 3 + 0) * 64 + c64] = l_p0[0][c64]+l_p0[1][c64]+l_p0[2][c64]+l_p0[3][c64]+l_p0[4][c64]+l_p0[5][c64]+l_p0[6][c64]+l_p0[7][c64];\n"
+"    } else if (wid < 4) {\n"
+"        int c64 = (wid - 2) * 32 + wlid;\n"
+"        ao4[(kv_h * 3 + 1) * 64 + c64] = l_p1[0][c64]+l_p1[1][c64]+l_p1[2][c64]+l_p1[3][c64]+l_p1[4][c64]+l_p1[5][c64]+l_p1[6][c64]+l_p1[7][c64];\n"
+"    } else if (wid < 6) {\n"
+"        int c64 = (wid - 4) * 32 + wlid;\n"
+"        ao4[(kv_h * 3 + 2) * 64 + c64] = l_p2[0][c64]+l_p2[1][c64]+l_p2[2][c64]+l_p2[3][c64]+l_p2[4][c64]+l_p2[5][c64]+l_p2[6][c64]+l_p2[7][c64];\n"
+"    }\n"
 "}\n"
 "\n"
-"/* 7. Wave32 2-Row-Pack SWAR 1.58-Bit Ternary LM_Head (100.6 MB in GDDR6 VRAM -> 0.45 ms!) */\n"
+"/* 7. Wave32 2-Row-Pack SWAR 1.58-Bit Ternary LM_Head (96 MB in GDDR6 VRAM -> 0.45 ms!) */\n"
 "__kernel __attribute__((reqd_work_group_size(32, 1, 1)))\n"
 "void k_lm_head_ternary_swar_2rp(\n"
 "    __global const uint4  * restrict lm_w,\n"
@@ -754,11 +821,13 @@ static const char *g_f3_opencl_shaders =
 "    }\n"
 "}\n"
 "\n"
-"/* 8. 131,072-Vocab Argmax in VRAM -> Returns 4-Byte Winning Token ID */\n"
+"/* 8. 131,072-Vocab Argmax in VRAM -> Writes Winning Token ID to d_best_id[0] & d_gen_ids[gen_slot] */\n"
 "__kernel __attribute__((reqd_work_group_size(256, 1, 1)))\n"
 "void k_argmax_131k(\n"
 "    __global const float * restrict logits,\n"
-"    __global int         * restrict out_best_id\n"
+"    __global int         * restrict out_best_id,\n"
+"    __global int         * restrict out_gen_ids,\n"
+"    const int gen_slot\n"
 ") {\n"
 "    __local float l_val[256];\n"
 "    __local int   l_idx[256];\n"
@@ -779,7 +848,11 @@ static const char *g_f3_opencl_shaders =
 "        }\n"
 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
 "    }\n"
-"    if (lid == 0) out_best_id[0] = l_idx[0];\n"
+"    if (lid == 0) {\n"
+"        int best = l_idx[0];\n"
+"        out_best_id[0]        = best;\n"
+"        out_gen_ids[gen_slot] = best;\n"
+"    }\n"
 "}\n";
 
 /* ============================================================================
@@ -883,8 +956,8 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     bb_cl_kernel k_embed        = clCreateKernel(prog, "k_embed_lookup", &err);
     bb_cl_kernel k_norm_quant   = clCreateKernel(prog, "k_rmsnorm_and_quant", &err);
     bb_cl_kernel k_quant        = clCreateKernel(prog, "k_quant_only", &err);
-    bb_cl_kernel k_qkv_2rp      = clCreateKernel(prog, "k_falcon3_qkv_swar_2rp", &err);
-    bb_cl_kernel k_ternary_2rp  = clCreateKernel(prog, "k_falcon3_ternary_swar_2rp", &err);
+    bb_cl_kernel k_ternary_3072 = clCreateKernel(prog, "k_falcon3_ternary_3072_2rp", &err);
+    bb_cl_kernel k_down_2rp     = clCreateKernel(prog, "k_falcon3_down_swar_2rp", &err);
     bb_cl_kernel k_gate_up_silu = clCreateKernel(prog, "k_falcon3_gate_up_silu_swar", &err);
     bb_cl_kernel k_rope_gqa     = clCreateKernel(prog, "k_fused_rope_gqa", &err);
     bb_cl_kernel k_lm_ternary   = clCreateKernel(prog, "k_lm_head_ternary_swar_2rp", &err);
@@ -893,7 +966,7 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     int is_bc250 = (bb_gpu_vram_mb() < 8000);
     printf("\n");
     printf("====================================================================================================\n");
-    printf("  BUILDBIT-OS v2.7 — WAVE32 SWAR 1.58-BIT TERNARY ENGINE (Falcon3-10B-Instruct-1.58bit)\n");
+    printf("  BUILDBIT-OS v2.8 — WAVE32 SWAR 1.58-BIT TERNARY ENGINE (Falcon3-10B-Instruct-1.58bit)\n");
     printf("  GPU Silicon: %s (%lld Compute Units @ %lld MHz | %lld MB VRAM + %lld MB Unified GDDR6)\n",
            is_bc250 ? "AMD BC-250 Cyan Skillfish RDNA2 gfx1013" : "AMD Radeon RX RDNA4 gfx1200",
            (long long)cu_count, (long long)bb_gpu_clock_mhz(),
@@ -931,6 +1004,7 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     bb_cl_mem d_sum_xq    = clCreateBuffer(ctx, 1, sizeof(int32_t), NULL, &err);
     bb_cl_mem d_logits    = clCreateBuffer(ctx, 1, F3_VOCAB * sizeof(float), NULL, &err);
     bb_cl_mem d_best_id   = clCreateBuffer(ctx, 1, sizeof(int32_t), NULL, &err);
+    bb_cl_mem d_gen_ids   = clCreateBuffer(ctx, 1, 256 * sizeof(int32_t), NULL, &err);
 
     /* Pre-Swizzle All 40 Layers of Ternary Weights In-Place in VRAM + Quantize 805 MB LM_Head -> 96 MB Ternary! */
     #define SWIZZLE_W(w_byte_off, n_bytes) do { \
@@ -970,56 +1044,84 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
            up_ms);
     fflush(stdout);
 
-    #define ENQUEUE_FUSED_QKV_SWAR(l_idx, kv_off_val) do { \
-        uint64_t qw_off = layers[l_idx].q_w_off; \
-        bb_cl_mem qkv_buf = (qw_off < split2) ? d_st_layers_lo : d_st_layers_hi; \
-        uint64_t qkv_base = (qw_off < split2) ? split1 : split2; \
-        uint64_t q_u128 = (qw_off - qkv_base) / 16ULL; \
-        uint64_t k_u128 = (layers[l_idx].k_w_off - qkv_base) / 16ULL; \
-        uint64_t v_u128 = (layers[l_idx].v_w_off - qkv_base) / 16ULL; \
-        float iqs = inv_q_s[l_idx], iks = inv_k_s[l_idx], ivs = inv_v_s[l_idx]; \
-        uint64_t kv_o = (uint64_t)(kv_off_val); \
-        clSetKernelArg(k_qkv_2rp, 0,  sizeof(bb_cl_mem), &qkv_buf); \
-        clSetKernelArg(k_qkv_2rp, 1,  sizeof(uint64_t),  &q_u128); \
-        clSetKernelArg(k_qkv_2rp, 2,  sizeof(uint64_t),  &k_u128); \
-        clSetKernelArg(k_qkv_2rp, 3,  sizeof(uint64_t),  &v_u128); \
-        clSetKernelArg(k_qkv_2rp, 4,  sizeof(float),     &iqs); \
-        clSetKernelArg(k_qkv_2rp, 5,  sizeof(float),     &iks); \
-        clSetKernelArg(k_qkv_2rp, 6,  sizeof(float),     &ivs); \
-        clSetKernelArg(k_qkv_2rp, 7,  sizeof(bb_cl_mem), &d_xq); \
-        clSetKernelArg(k_qkv_2rp, 8,  sizeof(bb_cl_mem), &d_x_scale); \
-        clSetKernelArg(k_qkv_2rp, 9,  sizeof(bb_cl_mem), &d_sum_xq); \
-        clSetKernelArg(k_qkv_2rp, 10, sizeof(bb_cl_mem), &d_q); \
-        clSetKernelArg(k_qkv_2rp, 11, sizeof(bb_cl_mem), &d_k_cache); \
-        clSetKernelArg(k_qkv_2rp, 12, sizeof(bb_cl_mem), &d_v_cache); \
-        clSetKernelArg(k_qkv_2rp, 13, sizeof(uint64_t),  &kv_o); \
-        size_t g_qkv = 640UL * 32UL, l_qkv = 32UL; \
-        clEnqueueNDRangeKernel(q, k_qkv_2rp, 1, NULL, &g_qkv, &l_qkv, 0, NULL, NULL); \
-    } while (0)
+    /* Pre-bind all invariant kernel arguments ONCE at startup (eliminates ~3,200 clSetKernelArg calls/token!) */
+    uint64_t embed_u16_off = global_offs[0] / 2ULL;
+    int dim_3072 = F3_DIM, dim_23040 = F3_FFN_DIM;
+    clSetKernelArg(k_embed, 0, sizeof(bb_cl_mem), &d_st_embed_lm);
+    clSetKernelArg(k_embed, 1, sizeof(bb_cl_mem), &d_x);
+    clSetKernelArg(k_embed, 2, sizeof(uint64_t),  &embed_u16_off);
+    clSetKernelArg(k_embed, 4, sizeof(bb_cl_mem), &d_best_id);
 
-    #define ENQUEUE_TERNARY_SWAR_2RP(w_byte_off, inv_s_val, out_mem, out_f_off, in_dim, out_dim, add_res) do { \
+    clSetKernelArg(k_norm_quant, 0, sizeof(bb_cl_mem), &d_x);
+    clSetKernelArg(k_norm_quant, 3, sizeof(bb_cl_mem), &d_xq);
+    clSetKernelArg(k_norm_quant, 4, sizeof(bb_cl_mem), &d_x_scale);
+    clSetKernelArg(k_norm_quant, 5, sizeof(bb_cl_mem), &d_sum_xq);
+
+    clSetKernelArg(k_quant, 1, sizeof(bb_cl_mem), &d_xq);
+    clSetKernelArg(k_quant, 2, sizeof(bb_cl_mem), &d_x_scale);
+    clSetKernelArg(k_quant, 3, sizeof(bb_cl_mem), &d_sum_xq);
+
+    clSetKernelArg(k_ternary_3072, 3, sizeof(bb_cl_mem), &d_xq);
+    clSetKernelArg(k_ternary_3072, 4, sizeof(bb_cl_mem), &d_x_scale);
+    clSetKernelArg(k_ternary_3072, 5, sizeof(bb_cl_mem), &d_sum_xq);
+
+    clSetKernelArg(k_down_2rp, 3, sizeof(bb_cl_mem), &d_xq);
+    clSetKernelArg(k_down_2rp, 4, sizeof(bb_cl_mem), &d_x_scale);
+    clSetKernelArg(k_down_2rp, 5, sizeof(bb_cl_mem), &d_sum_xq);
+    clSetKernelArg(k_down_2rp, 6, sizeof(bb_cl_mem), &d_x);
+
+    clSetKernelArg(k_gate_up_silu, 6, sizeof(bb_cl_mem), &d_xq);
+    clSetKernelArg(k_gate_up_silu, 7, sizeof(bb_cl_mem), &d_x_scale);
+    clSetKernelArg(k_gate_up_silu, 8, sizeof(bb_cl_mem), &d_sum_xq);
+    clSetKernelArg(k_gate_up_silu, 9, sizeof(bb_cl_mem), &d_swiglu);
+
+    clSetKernelArg(k_rope_gqa, 0, sizeof(bb_cl_mem), &d_q);
+    clSetKernelArg(k_rope_gqa, 1, sizeof(bb_cl_mem), &d_k_cache);
+    clSetKernelArg(k_rope_gqa, 2, sizeof(bb_cl_mem), &d_v_cache);
+    clSetKernelArg(k_rope_gqa, 3, sizeof(bb_cl_mem), &d_attn_out);
+
+    clSetKernelArg(k_lm_ternary, 0, sizeof(bb_cl_mem), &d_lm_ternary_w);
+    clSetKernelArg(k_lm_ternary, 1, sizeof(bb_cl_mem), &d_lm_ternary_s);
+    clSetKernelArg(k_lm_ternary, 2, sizeof(bb_cl_mem), &d_xq);
+    clSetKernelArg(k_lm_ternary, 3, sizeof(bb_cl_mem), &d_x_scale);
+    clSetKernelArg(k_lm_ternary, 4, sizeof(bb_cl_mem), &d_sum_xq);
+    clSetKernelArg(k_lm_ternary, 5, sizeof(bb_cl_mem), &d_logits);
+
+    clSetKernelArg(k_argmax, 0, sizeof(bb_cl_mem), &d_logits);
+    clSetKernelArg(k_argmax, 1, sizeof(bb_cl_mem), &d_best_id);
+    clSetKernelArg(k_argmax, 2, sizeof(bb_cl_mem), &d_gen_ids);
+
+    #define ENQUEUE_TERNARY_3072_2RP(w_byte_off, inv_s_val, out_mem, out_f_off, out_dim, add_res) do { \
         bb_cl_mem w_buf = ((w_byte_off) < split2) ? d_st_layers_lo : d_st_layers_hi; \
         uint64_t w_base = ((w_byte_off) < split2) ? split1 : split2; \
         uint64_t w_u128 = ((w_byte_off) - w_base) / 16ULL; \
         float inv_s_v   = (inv_s_val); \
         uint64_t o_foff = (uint64_t)(out_f_off); \
-        int in_u128_v   = (in_dim) / 16; \
         int r_packs_v   = (out_dim) / 4; \
         int add_res_v   = (add_res); \
-        clSetKernelArg(k_ternary_2rp, 0,  sizeof(bb_cl_mem), &w_buf); \
-        clSetKernelArg(k_ternary_2rp, 1,  sizeof(uint64_t),  &w_u128); \
-        clSetKernelArg(k_ternary_2rp, 2,  sizeof(float),     &inv_s_v); \
-        clSetKernelArg(k_ternary_2rp, 3,  sizeof(bb_cl_mem), &d_xq); \
-        clSetKernelArg(k_ternary_2rp, 4,  sizeof(bb_cl_mem), &d_x_scale); \
-        clSetKernelArg(k_ternary_2rp, 5,  sizeof(bb_cl_mem), &d_sum_xq); \
-        clSetKernelArg(k_ternary_2rp, 6,  sizeof(bb_cl_mem), &(out_mem)); \
-        clSetKernelArg(k_ternary_2rp, 7,  sizeof(uint64_t),  &o_foff); \
-        clSetKernelArg(k_ternary_2rp, 8,  sizeof(int),       &in_u128_v); \
-        clSetKernelArg(k_ternary_2rp, 9,  sizeof(int),       &r_packs_v); \
-        clSetKernelArg(k_ternary_2rp, 10, sizeof(int),       &add_res_v); \
+        clSetKernelArg(k_ternary_3072, 0, sizeof(bb_cl_mem), &w_buf); \
+        clSetKernelArg(k_ternary_3072, 1, sizeof(uint64_t),  &w_u128); \
+        clSetKernelArg(k_ternary_3072, 2, sizeof(float),     &inv_s_v); \
+        clSetKernelArg(k_ternary_3072, 6, sizeof(bb_cl_mem), &(out_mem)); \
+        clSetKernelArg(k_ternary_3072, 7, sizeof(uint64_t),  &o_foff); \
+        clSetKernelArg(k_ternary_3072, 8, sizeof(int),       &r_packs_v); \
+        clSetKernelArg(k_ternary_3072, 9, sizeof(int),       &add_res_v); \
         size_t gsz = (size_t)(r_packs_v / 2) * 32; \
         size_t lsz = 32; \
-        clEnqueueNDRangeKernel(q, k_ternary_2rp, 1, NULL, &gsz, &lsz, 0, NULL, NULL); \
+        clEnqueueNDRangeKernel(q, k_ternary_3072, 1, NULL, &gsz, &lsz, 0, NULL, NULL); \
+    } while (0)
+
+    #define ENQUEUE_DOWN_SWAR_2RP(l_idx) do { \
+        uint64_t dw_off = layers[l_idx].down_w_off; \
+        bb_cl_mem w_buf = (dw_off < split2) ? d_st_layers_lo : d_st_layers_hi; \
+        uint64_t w_base = (dw_off < split2) ? split1 : split2; \
+        uint64_t w_u128 = (dw_off - w_base) / 16ULL; \
+        float ids       = inv_down_s[l_idx]; \
+        clSetKernelArg(k_down_2rp, 0, sizeof(bb_cl_mem), &w_buf); \
+        clSetKernelArg(k_down_2rp, 1, sizeof(uint64_t),  &w_u128); \
+        clSetKernelArg(k_down_2rp, 2, sizeof(float),     &ids); \
+        size_t g_dn = 384UL * 32UL, l_dn = 32UL; \
+        clEnqueueNDRangeKernel(q, k_down_2rp, 1, NULL, &g_dn, &l_dn, 0, NULL, NULL); \
     } while (0)
 
     #define ENQUEUE_FUSED_GATE_UP_SILU(l_idx) do { \
@@ -1036,26 +1138,16 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
         clSetKernelArg(k_gate_up_silu, 3, sizeof(bb_cl_mem), &u_buf); \
         clSetKernelArg(k_gate_up_silu, 4, sizeof(uint64_t),  &u_u128); \
         clSetKernelArg(k_gate_up_silu, 5, sizeof(float),     &ius); \
-        clSetKernelArg(k_gate_up_silu, 6, sizeof(bb_cl_mem), &d_xq); \
-        clSetKernelArg(k_gate_up_silu, 7, sizeof(bb_cl_mem), &d_x_scale); \
-        clSetKernelArg(k_gate_up_silu, 8, sizeof(bb_cl_mem), &d_sum_xq); \
-        clSetKernelArg(k_gate_up_silu, 9, sizeof(bb_cl_mem), &d_swiglu); \
         size_t g_gu = 5760UL * 32UL, l_gu = 32UL; \
         clEnqueueNDRangeKernel(q, k_gate_up_silu, 1, NULL, &g_gu, &l_gu, 0, NULL, NULL); \
     } while (0)
 
-    #define ENQUEUE_RMSNORM_QUANT(vec_mem, norm_byte_off, dim_v) do { \
+    #define ENQUEUE_RMSNORM_QUANT(norm_byte_off) do { \
         bb_cl_mem n_buf = ((norm_byte_off) < split2) ? d_st_layers_lo : d_st_layers_hi; \
         uint64_t  n_u16 = ((norm_byte_off) - (((norm_byte_off) < split2) ? split1 : split2)) / 2ULL; \
-        int dv = (dim_v); \
         size_t l256 = 256; \
-        clSetKernelArg(k_norm_quant, 0, sizeof(bb_cl_mem), &(vec_mem)); \
         clSetKernelArg(k_norm_quant, 1, sizeof(bb_cl_mem), &n_buf); \
         clSetKernelArg(k_norm_quant, 2, sizeof(uint64_t),  &n_u16); \
-        clSetKernelArg(k_norm_quant, 3, sizeof(bb_cl_mem), &d_xq); \
-        clSetKernelArg(k_norm_quant, 4, sizeof(bb_cl_mem), &d_x_scale); \
-        clSetKernelArg(k_norm_quant, 5, sizeof(bb_cl_mem), &d_sum_xq); \
-        clSetKernelArg(k_norm_quant, 6, sizeof(int),       &dv); \
         clEnqueueNDRangeKernel(q, k_norm_quant, 1, NULL, &l256, &l256, 0, NULL, NULL); \
     } while (0)
 
@@ -1063,24 +1155,20 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
      * PART 1: Pure 40-Layer Wave32 SWAR Ternary Benchmark (After 2000 MHz Warmup)
      * ======================================================================== */
     int tok0 = prompt_ids[0];
-    uint64_t embed_u16_off = global_offs[0] / 2ULL;
     size_t g_emb = 3072, l_256 = 256;
-    clSetKernelArg(k_embed, 0, sizeof(bb_cl_mem), &d_st_embed_lm);
-    clSetKernelArg(k_embed, 1, sizeof(bb_cl_mem), &d_x);
-    clSetKernelArg(k_embed, 2, sizeof(uint64_t),  &embed_u16_off);
-    clSetKernelArg(k_embed, 3, sizeof(int),       &tok0);
+    clSetKernelArg(k_embed, 3, sizeof(int), &tok0);
     clEnqueueNDRangeKernel(q, k_embed, 1, NULL, &g_emb, &l_256, 0, NULL, NULL);
-    ENQUEUE_RMSNORM_QUANT(d_x, layers[0].in_norm_off, F3_DIM);
+    ENQUEUE_RMSNORM_QUANT(layers[0].in_norm_off);
 
     /* Warmup pass (ensures BC-250 GPU governor boosts SCLK to 2000 MHz DPM State 2!) */
     for (int w = 0; w < 4; w++) {
         for (int l = 0; l < F3_LAYERS; l++) {
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].q_w_off,    inv_q_s[l],    d_q,       0, F3_DIM,     F3_DIM,    0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].k_w_off,    inv_k_s[l],    d_k_cache, 0, F3_DIM,     F3_KV_DIM, 0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].v_w_off,    inv_v_s[l],    d_v_cache, 0, F3_DIM,     F3_KV_DIM, 0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].o_w_off,    inv_o_s[l],    d_x,       0, F3_DIM,     F3_DIM,    1);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].q_w_off, inv_q_s[l], d_q,       0, F3_DIM,    0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].k_w_off, inv_k_s[l], d_k_cache, 0, F3_KV_DIM, 0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].v_w_off, inv_v_s[l], d_v_cache, 0, F3_KV_DIM, 0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].o_w_off, inv_o_s[l], d_x,       0, F3_DIM,    1);
             ENQUEUE_FUSED_GATE_UP_SILU(l);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].down_w_off, inv_down_s[l], d_x,       0, F3_FFN_DIM, F3_DIM,    1);
+            ENQUEUE_DOWN_SWAR_2RP(l);
         }
     }
     clFinish(q);
@@ -1089,12 +1177,12 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     double bench_t0 = bb_f3_ms();
     for (int it = 0; it < BENCH_ITERS; it++) {
         for (int l = 0; l < F3_LAYERS; l++) {
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].q_w_off,    inv_q_s[l],    d_q,       0, F3_DIM,     F3_DIM,    0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].k_w_off,    inv_k_s[l],    d_k_cache, 0, F3_DIM,     F3_KV_DIM, 0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].v_w_off,    inv_v_s[l],    d_v_cache, 0, F3_DIM,     F3_KV_DIM, 0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].o_w_off,    inv_o_s[l],    d_x,       0, F3_DIM,     F3_DIM,    1);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].q_w_off, inv_q_s[l], d_q,       0, F3_DIM,    0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].k_w_off, inv_k_s[l], d_k_cache, 0, F3_KV_DIM, 0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].v_w_off, inv_v_s[l], d_v_cache, 0, F3_KV_DIM, 0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].o_w_off, inv_o_s[l], d_x,       0, F3_DIM,    1);
             ENQUEUE_FUSED_GATE_UP_SILU(l);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].down_w_off, inv_down_s[l], d_x,       0, F3_FFN_DIM, F3_DIM,    1);
+            ENQUEUE_DOWN_SWAR_2RP(l);
         }
     }
     clFinish(q);
@@ -1117,6 +1205,7 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
 
     /* ========================================================================
      * PART 2: Full End-to-End 40-Layer + Ternary 131K LM_Head Generation
+     *         with GPU-Resident Token Chaining & 8-Way Time-Parallel Wave32 GQA!
      * ======================================================================== */
     printf("  [LIVE 100%% GPU-VRAM GENERATION] tiiuae/Falcon3-10B-Instruct-1.58bit (10.3B PARAMS)\n");
     printf("  --------------------------------------------------------------------------------------------------\n");
@@ -1125,112 +1214,95 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     fflush(stdout);
 
     int pos = 0;
-    int next_tok = 0;
     const int GEN_TOKENS = 48;
     uint32_t total_steps = n_prompt + GEN_TOKENS - 1;
-    int dim_3072 = F3_DIM, dim_23040 = F3_FFN_DIM;
+    size_t g_rgqa = 4 * 256, g_lm = (size_t)(F3_VOCAB / 8) * 32;
     double prefill_t0 = bb_f3_ms();
     double decode_t0  = 0.0;
-    int gen_count = 0;
+    int gen_slot = 0;
 
     for (uint32_t step = 0; step < total_steps; step++) {
-        int cur_tok = (step < n_prompt) ? prompt_ids[step] : next_tok;
+        int cur_tok = (step < n_prompt) ? prompt_ids[step] : -1; /* -1 chains directly from d_best_id[0] in VRAM! */
         int compute_logits = (step + 1 >= n_prompt) ? 1 : 0;
 
-        /* 1. Token Embedding Lookup in VRAM */
-        clSetKernelArg(k_embed, 0, sizeof(bb_cl_mem), &d_st_embed_lm);
-        clSetKernelArg(k_embed, 1, sizeof(bb_cl_mem), &d_x);
-        clSetKernelArg(k_embed, 2, sizeof(uint64_t),  &embed_u16_off);
-        clSetKernelArg(k_embed, 3, sizeof(int),       &cur_tok);
+        /* 1. Token Embedding Lookup in VRAM (reads prompt_ids[step] or chains directly from d_best_id[0]!) */
+        clSetKernelArg(k_embed, 3, sizeof(int), &cur_tok);
         clEnqueueNDRangeKernel(q, k_embed, 1, NULL, &g_emb, &l_256, 0, NULL, NULL);
 
         /* 2. All 40 Layers Executed Inside GDDR6 VRAM via Fused Wave32 SWAR */
         for (int l = 0; l < F3_LAYERS; l++) {
             uint64_t kv_slot_off = ((uint64_t)l * 256ULL + (uint64_t)pos) * 1024ULL;
 
-            /* 2a. Pre-Attention RMSNorm + INT8 Quantization */
-            ENQUEUE_RMSNORM_QUANT(d_x, layers[l].in_norm_off, F3_DIM);
+            /* 2a. Pre-Attention Single-Pass float4 RMSNorm + INT8 Quantization */
+            ENQUEUE_RMSNORM_QUANT(layers[l].in_norm_off);
 
-            /* 2b. Q, K, V 1.58-Bit Ternary Projections (Wave32 2-Row-Pack SWAR) */
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].q_w_off, inv_q_s[l], d_q,       0,           F3_DIM, F3_DIM,    0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].k_w_off, inv_k_s[l], d_k_cache, kv_slot_off, F3_DIM, F3_KV_DIM, 0);
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].v_w_off, inv_v_s[l], d_v_cache, kv_slot_off, F3_DIM, F3_KV_DIM, 0);
+            /* 2b. Q, K, V 1.58-Bit Ternary Projections (Overflow-Free 3,072-Dim Wave32 SWAR) */
+            ENQUEUE_TERNARY_3072_2RP(layers[l].q_w_off, inv_q_s[l], d_q,       0,           F3_DIM,    0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].k_w_off, inv_k_s[l], d_k_cache, kv_slot_off, F3_KV_DIM, 0);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].v_w_off, inv_v_s[l], d_v_cache, kv_slot_off, F3_KV_DIM, 0);
 
-            /* 2c. Fused Multi-Query RoPE + GQA Attention (4 KV Workgroups x 3 Q Heads) */
-            size_t g_rgqa = 4 * 128, l_128 = 128;
-            clSetKernelArg(k_rope_gqa, 0, sizeof(bb_cl_mem), &d_q);
-            clSetKernelArg(k_rope_gqa, 1, sizeof(bb_cl_mem), &d_k_cache);
-            clSetKernelArg(k_rope_gqa, 2, sizeof(bb_cl_mem), &d_v_cache);
-            clSetKernelArg(k_rope_gqa, 3, sizeof(bb_cl_mem), &d_attn_out);
-            clSetKernelArg(k_rope_gqa, 4, sizeof(int),       &l);
-            clSetKernelArg(k_rope_gqa, 5, sizeof(int),       &pos);
-            clEnqueueNDRangeKernel(q, k_rope_gqa, 1, NULL, &g_rgqa, &l_128, 0, NULL, NULL);
+            /* 2c. 8-Way Time-Parallel Wave32 RoPE + GQA Attention (4 KV Workgroups x 8 Wave32s) */
+            clSetKernelArg(k_rope_gqa, 4, sizeof(int), &l);
+            clSetKernelArg(k_rope_gqa, 5, sizeof(int), &pos);
+            clEnqueueNDRangeKernel(q, k_rope_gqa, 1, NULL, &g_rgqa, &l_256, 0, NULL, NULL);
 
             /* 2d. Quantize Attn_Out + 1.58-Bit Ternary O_Proj (+ Residual into d_x) */
             clSetKernelArg(k_quant, 0, sizeof(bb_cl_mem), &d_attn_out);
-            clSetKernelArg(k_quant, 1, sizeof(bb_cl_mem), &d_xq);
-            clSetKernelArg(k_quant, 2, sizeof(bb_cl_mem), &d_x_scale);
-            clSetKernelArg(k_quant, 3, sizeof(bb_cl_mem), &d_sum_xq);
             clSetKernelArg(k_quant, 4, sizeof(int),       &dim_3072);
             clEnqueueNDRangeKernel(q, k_quant, 1, NULL, &l_256, &l_256, 0, NULL, NULL);
-
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].o_w_off, inv_o_s[l], d_x, 0, F3_DIM, F3_DIM, 1);
+            ENQUEUE_TERNARY_3072_2RP(layers[l].o_w_off, inv_o_s[l], d_x, 0, F3_DIM, 1);
 
             /* 2e. Post-Attention RMSNorm + Fused Gate + Up + SiLU Wave32 SWAR */
-            ENQUEUE_RMSNORM_QUANT(d_x, layers[l].post_norm_off, F3_DIM);
+            ENQUEUE_RMSNORM_QUANT(layers[l].post_norm_off);
             ENQUEUE_FUSED_GATE_UP_SILU(l);
 
-            /* 2f. Quantize 23,040-dim SwiGLU + 1.58-Bit Ternary Down_Proj (+ Residual into d_x) */
+            /* 2f. Quantize 23,040-dim SwiGLU + Branchless-Block 1.58-Bit Ternary Down_Proj (+ Residual into d_x) */
             clSetKernelArg(k_quant, 0, sizeof(bb_cl_mem), &d_swiglu);
-            clSetKernelArg(k_quant, 1, sizeof(bb_cl_mem), &d_xq);
-            clSetKernelArg(k_quant, 2, sizeof(bb_cl_mem), &d_x_scale);
-            clSetKernelArg(k_quant, 3, sizeof(bb_cl_mem), &d_sum_xq);
             clSetKernelArg(k_quant, 4, sizeof(int),       &dim_23040);
             clEnqueueNDRangeKernel(q, k_quant, 1, NULL, &l_256, &l_256, 0, NULL, NULL);
-
-            ENQUEUE_TERNARY_SWAR_2RP(layers[l].down_w_off, inv_down_s[l], d_x, 0, F3_FFN_DIM, F3_DIM, 1);
-
-            if ((l & 7) == 1 && clFlush) clFlush(q);
+            ENQUEUE_DOWN_SWAR_2RP(l);
         }
 
         pos++;
 
         if (compute_logits) {
             /* 3. Final RMSNorm + INT8 Quantization in VRAM */
-            ENQUEUE_RMSNORM_QUANT(d_x, global_offs[1], F3_DIM);
+            ENQUEUE_RMSNORM_QUANT(global_offs[1]);
 
             /* 4. 131,072-Vocab 1.58-Bit Ternary LM Head (96 MB in VRAM!) + Argmax */
-            size_t g_lm = (size_t)(F3_VOCAB / 8) * 32; /* 16,384 Wave32 workgroups (8 rows/Wave32) */
-            clSetKernelArg(k_lm_ternary, 0, sizeof(bb_cl_mem), &d_lm_ternary_w);
-            clSetKernelArg(k_lm_ternary, 1, sizeof(bb_cl_mem), &d_lm_ternary_s);
-            clSetKernelArg(k_lm_ternary, 2, sizeof(bb_cl_mem), &d_xq);
-            clSetKernelArg(k_lm_ternary, 3, sizeof(bb_cl_mem), &d_x_scale);
-            clSetKernelArg(k_lm_ternary, 4, sizeof(bb_cl_mem), &d_sum_xq);
-            clSetKernelArg(k_lm_ternary, 5, sizeof(bb_cl_mem), &d_logits);
             clEnqueueNDRangeKernel(q, k_lm_ternary, 1, NULL, &g_lm, &l_32, 0, NULL, NULL);
 
-            clSetKernelArg(k_argmax, 0, sizeof(bb_cl_mem), &d_logits);
-            clSetKernelArg(k_argmax, 1, sizeof(bb_cl_mem), &d_best_id);
+            clSetKernelArg(k_argmax, 3, sizeof(int), &gen_slot);
             clEnqueueNDRangeKernel(q, k_argmax, 1, NULL, &l_256, &l_256, 0, NULL, NULL);
-
-            /* Read ONLY 4 Bytes (`next_tok`) from GDDR6 VRAM! */
-            clEnqueueReadBuffer(q, d_best_id, 1, 0, sizeof(int), &next_tok, 0, NULL, NULL);
+            gen_slot++;
 
             if (step + 1 == n_prompt) {
+                /* Synchronize at end of prefill so prefill_ms and decode_t0 are exact hardware times! */
+                clFinish(q);
                 decode_t0 = bb_f3_ms();
+            } else if (clFlush) {
+                clFlush(q);
             }
-            if (next_tok == 11 /* <|endoftext|> */) break;
-            fwrite(vocab[next_tok].str, 1, vocab[next_tok].len, stdout);
-            fflush(stdout);
-            gen_count++;
         } else if (clFlush) {
             clFlush(q);
         }
     }
-    clFinish(q);
-    double decode_ms = bb_f3_ms() - decode_t0;
+
+    int host_gen_ids[256];
+    clEnqueueReadBuffer(q, d_gen_ids, 1, 0, (size_t)gen_slot * sizeof(int), host_gen_ids, 0, NULL, NULL);
+    double decode_ms  = bb_f3_ms() - decode_t0;
     double prefill_ms = decode_t0 - prefill_t0;
-    double ms_per_tok = (gen_count > 1) ? (decode_ms / (double)(gen_count - 1)) : decode_ms;
+
+    int gen_count = 0;
+    for (int i = 0; i < gen_slot; i++) {
+        int tok = host_gen_ids[i];
+        if (tok == 11 /* <|endoftext|> */) break;
+        fwrite(vocab[tok].str, 1, vocab[tok].len, stdout);
+        gen_count++;
+    }
+    fflush(stdout);
+
+    double ms_per_tok  = (gen_slot > 1) ? (decode_ms / (double)(gen_slot - 1)) : decode_ms;
     double tok_per_sec = 1000.0 / (ms_per_tok > 0.01 ? ms_per_tok : 0.01);
 
     printf("\033[0m\n");
@@ -1241,8 +1313,8 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
            n_prompt, prefill_ms, 1000.0 / (prefill_ms / (double)n_prompt), ms_per_tok, tok_per_sec);
     printf("====================================================================================================\n");
 
-    #undef ENQUEUE_FUSED_QKV_SWAR
-    #undef ENQUEUE_TERNARY_SWAR_2RP
+    #undef ENQUEUE_TERNARY_3072_2RP
+    #undef ENQUEUE_DOWN_SWAR_2RP
     #undef ENQUEUE_FUSED_GATE_UP_SILU
     #undef ENQUEUE_RMSNORM_QUANT
     free(vocab);
