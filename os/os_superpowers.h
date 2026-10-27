@@ -470,9 +470,12 @@ static inline int64_t bb_run_os_superpowers_suite(
 ) {
     printf("\n");
     printf("====================================================================================================\n");
-    printf("  BUILDBIT-OS v2.4 — 6-PILLAR ARCHITECTURAL SUPERPOWERS BENCHMARK vs. STANDARD LINUX (KERNEL 6.14)\n");
-    printf("  Hardware: 24-Thread Intel Xeon Gold 6136 + AMD Radeon RX gfx1200 (%lld CUs, 63.7 GB Zero-Copy GTT)\n",
-           (long long)cu_count);
+    printf("  BUILDBIT-OS v2.6 — 6-PILLAR ARCHITECTURAL SUPERPOWERS BENCHMARK vs. STANDARD LINUX\n");
+    printf("  Hardware: %s (%lld CUs, %.1f GB Unified/Zero-Copy GTT)\n",
+           (bb_gpu_vram_mb() < 8000)
+               ? "AMD BC-250 (16-Thread Zen 2 APU + Cyan Skillfish RDNA2 gfx1013)"
+               : "24-Thread Intel Xeon Gold 6136 + AMD Radeon RX gfx1200",
+           (long long)cu_count, (double)bb_gpu_gtt_mb() / 1024.0);
     printf("====================================================================================================\n\n");
 
     /* 1. Run Pillar 1: Local 1.58-Bit Ternary LLM Inference */

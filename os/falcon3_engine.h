@@ -489,15 +489,25 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
 ) {
     (void)gpu_arena_mem;
     (void)gpu_arena_bytes;
-    const char *st_path = "/home/phil/.cache/huggingface/hub/models--tiiuae--Falcon3-10B-Instruct-1.58bit/snapshots/4b61e8876b19bf7a4b271b757a1bd2974bf38913/model.safetensors";
+    const char *st_path = "/dev/shm/model.safetensors";
+    int st_rw = 1;
+    int st_fd = open(st_path, O_RDWR);
+    if (st_fd < 0) {
+        st_rw = 0;
+        st_path = "/home/phil/.cache/huggingface/hub/models--tiiuae--Falcon3-10B-Instruct-1.58bit/snapshots/4b61e8876b19bf7a4b271b757a1bd2974bf38913/model.safetensors";
+        st_fd = open(st_path, O_RDONLY);
+    }
     const char *meta_path = "/tmp/falcon3_10b_meta.bin";
 
-    int st_fd = open(st_path, O_RDONLY);
     if (st_fd < 0) { printf("[Error] Cannot open %s\n", st_path); return -1; }
     struct stat st_stat;
     fstat(st_fd, &st_stat);
     size_t st_size = (size_t)st_stat.st_size;
-    void *st_base = mmap(NULL, st_size, PROT_READ, MAP_PRIVATE, st_fd, 0);
+    /* NOTE: amdgpu KFD init_user_pages() calls get_user_pages(FOLL_WRITE) even for CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR!
+     * Mapping /dev/shm/model.safetensors with PROT_READ | PROT_WRITE, MAP_SHARED allows true Zero-Copy Unified GDDR6 GTT pinning! */
+    void *st_base = st_rw
+        ? mmap(NULL, st_size, PROT_READ | PROT_WRITE, MAP_SHARED, st_fd, 0)
+        : mmap(NULL, st_size, PROT_READ, MAP_PRIVATE, st_fd, 0);
 
     FILE *mf = fopen(meta_path, "rb");
     if (!mf) { printf("[Error] Cannot open %s\n", meta_path); return -1; }
@@ -513,7 +523,7 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     if (fread(vocab, sizeof(bb_f3_vocab_entry_t), F3_VOCAB, mf) != F3_VOCAB) return -1;
     fclose(mf);
 
-    /* Initialize ROCm / OpenCL on AMDGPU gfx1200 */
+    /* Initialize ROCm / OpenCL on AMDGPU (BC-250 Cyan Skillfish gfx1013 or Radeon RX gfx1200) */
     void *lib = dlopen("/opt/rocm/lib/libOpenCL.so.1", RTLD_LAZY);
     if (!lib) lib = dlopen("libOpenCL.so.1", RTLD_LAZY);
     bb_cl_int (*clGetPlatformIDs)(bb_cl_uint, bb_cl_platform_id *, bb_cl_uint *) = dlsym(lib, "clGetPlatformIDs");
@@ -564,26 +574,33 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     bb_cl_kernel k_lm_head    = clCreateKernel(prog, "k_lm_head_bf16", &err);
     bb_cl_kernel k_argmax     = clCreateKernel(prog, "k_argmax_131k", &err);
 
+    int is_bc250 = (bb_gpu_vram_mb() < 8000);
     printf("\n");
     printf("====================================================================================================\n");
     printf("  BUILDBIT-OS v2.6 — 100%% GPU-VRAM-RESIDENT 1.58-BIT TERNARY ENGINE (Falcon3-10B-Instruct-1.58bit)\n");
-    printf("  GPU Silicon: AMD Radeon RX gfx1200 (%lld Compute Units @ 2700 MHz | 16,230 MB GDDR6 VRAM)\n",
-           (long long)cu_count);
+    printf("  GPU Silicon: %s (%lld Compute Units @ %lld MHz | %lld MB VRAM + %lld MB Unified GDDR6)\n",
+           is_bc250 ? "AMD BC-250 Cyan Skillfish RDNA2 gfx1013" : "AMD Radeon RX RDNA4 gfx1200",
+           (long long)cu_count, (long long)bb_gpu_clock_mhz(),
+           (long long)bb_gpu_vram_mb(), (long long)bb_gpu_gtt_mb());
     printf("====================================================================================================\n");
 
-    /* Note: In Falcon3-10B safetensors, all BF16 norms/scales for all 40 layers are stored at
-     * [1610612736 .. 1611110960] (~500 KB), followed by Layer 0..19 ternary weights and Layer 20..39 ternary weights!
-     * Let's split at Layer 20's first ternary weight (`layers[20].down_w_off`) so:
-     *   - d_st_embed_lm:   [0 .. split1]          (~1.50 GB: Embed + LM_Head)
-     *   - d_st_layers_lo:  [split1 .. split2]     (~1.13 GB: All Norms/Scales + Layers 0..19 Ternary Weights)
-     *   - d_st_layers_hi:  [split2 .. st_size]    (~1.13 GB: Layers 20..39 Ternary Weights) */
     double up_t0 = bb_f3_ms();
     uint64_t split1 = layers[0].in_norm_off;
     uint64_t split2 = layers[3].down_w_off; /* Exact 1.36 GB / 1.01 GB boundary in alphabetical safetensors order */
 
-    bb_cl_mem d_st_embed_lm  = clCreateBuffer(ctx, 36, (size_t)split1, (uint8_t *)st_base, &err);
+    bb_cl_ulong embed_flags = (is_bc250 && st_rw) ? 12ULL : 36ULL;
+    bb_cl_mem d_st_embed_lm  = clCreateBuffer(ctx, embed_flags, (size_t)split1, (uint8_t *)st_base, &err);
+    if (!d_st_embed_lm || err != 0) {
+        d_st_embed_lm = clCreateBuffer(ctx, 36ULL, (size_t)split1, (uint8_t *)st_base, &err);
+    }
     bb_cl_mem d_st_layers_lo = clCreateBuffer(ctx, 36, (size_t)(split2 - split1), (uint8_t *)st_base + split1, &err);
     bb_cl_mem d_st_layers_hi = clCreateBuffer(ctx, 36, (size_t)(st_size - split2), (uint8_t *)st_base + split2, &err);
+    if (!d_st_embed_lm || !d_st_layers_lo || !d_st_layers_hi) {
+        printf("[Error] clCreateBuffer failed: embed=%p lo=%p hi=%p (err=%d)\n",
+               (void *)d_st_embed_lm, (void *)d_st_layers_lo, (void *)d_st_layers_hi, err);
+        fflush(stdout);
+        return -1;
+    }
 
     /* Allocate All Activation & KV-Cache Tensors 100% Inside GDDR6 VRAM */
     bb_cl_mem d_k_cache   = clCreateBuffer(ctx, 1, (size_t)F3_LAYERS * F3_MAX_SEQ * F3_KV_DIM * sizeof(float), NULL, &err);
@@ -603,6 +620,7 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
 
     printf("  [VRAM UPLOAD] Loaded Full 10.3B Model (%.2f GB: 40 Ternary Layers + 131K Vocab) into GDDR6 VRAM in %.1f ms\n\n",
            (double)st_size / (1024.0 * 1024.0 * 1024.0), up_ms);
+    fflush(stdout);
 
     #define ENQUEUE_TERNARY_GEMV(layer_idx, w_byte_off, s_byte_off, out_mem, out_f_off, in_dim, out_dim, add_res) do { \
         (void)(layer_idx); \
@@ -671,12 +689,15 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
     printf("  [GDDR6 VRAM WAVE64 BENCHMARK] 40-Layer Falcon3-10B Ternary Projections (2.375 GB / Token)\n");
     printf("  --------------------------------------------------------------------------------------------------\n");
     printf("    * CPU DDR4 OpenMP AVX2 (Previous Prototype)                   :    65.70 ms/tok  ( 15.2 Tok/s)\n");
-    printf("    * AMDGPU gfx1200 GDDR6 VRAM Wave64 Compute Shaders            : %8.2f ms/tok  (%5.1f Tok/s!)\n",
+    printf("    * %-59s : %8.2f ms/tok  (%5.1f Tok/s!)\n",
+           is_bc250 ? "AMD BC-250 gfx1013 Unified GDDR6 Wavefront Shaders"
+                    : "AMDGPU gfx1200 GDDR6 VRAM Wave64 Compute Shaders",
            pure_40layer_ternary_ms, pure_40layer_tps);
-    printf("    * Sustained GDDR6 VRAM Bandwidth across 32 Compute Units      : %8.1f GB/s\n",
-           vram_bw_gbs);
-    printf("    >>> RESULT: %.1fx FASTER on AMDGPU GDDR6 VRAM vs. CPU DDR4!\n\n",
-           65.70 / pure_40layer_ternary_ms);
+    printf("    * Sustained GDDR6 Bandwidth across %2lld Compute Units            : %8.1f GB/s\n",
+           (long long)cu_count, vram_bw_gbs);
+    printf("    >>> RESULT: %.1fx FASTER on %s vs. CPU DDR4!\n\n",
+           65.70 / pure_40layer_ternary_ms,
+           is_bc250 ? "AMD BC-250 Unified GDDR6" : "AMDGPU GDDR6 VRAM");
 
     /* ========================================================================
      * PART 2: Full End-to-End 40-Layer Generation (100% Inside AMDGPU VRAM!)
@@ -723,7 +744,7 @@ static inline int64_t bb_run_falcon3_10b_ternary_engine(
             clEnqueueNDRangeKernel(q, k_norm_quant, 1, NULL, &l_256, &l_256, 0, NULL, NULL);
 
             /* 2b. Q, K, V 1.58-Bit Ternary Projections */
-            ENQUEUE_TERNARY_GEMV(l, layers[l].q_w_off, layers[l].q_s_off, d_q,       0,           F3_DIM, F3_DIM,    0);
+            ENQUEUE_TERNARY_GEMV(l, layers[l].q_w_off, layers[l].k_s_off ? layers[l].q_s_off : layers[l].q_s_off, d_q, 0, F3_DIM, F3_DIM, 0);
             ENQUEUE_TERNARY_GEMV(l, layers[l].k_w_off, layers[l].k_s_off, d_k_cache, kv_slot_off, F3_DIM, F3_KV_DIM, 0);
             ENQUEUE_TERNARY_GEMV(l, layers[l].v_w_off, layers[l].v_s_off, d_v_cache, kv_slot_off, F3_DIM, F3_KV_DIM, 0);
 
