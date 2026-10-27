@@ -1,9 +1,9 @@
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -Werror
 
-.PHONY: all os gui_kernel gui_iso boot-mint-gpu boot-gpu-os boot-gui-iso boot-os compare-os test-20-packages clean
+.PHONY: all os gui_kernel gui_iso boot-mint-gpu boot-gpu-os boot-gui-iso boot-os compare-os test-20-packages superpowers clean
 
-all: bbc os gui_kernel gpu_os gpu_desktop
+all: bbc os gui_kernel gpu_os gpu_desktop superpowers
 
 # 1. Buildbit Systems & Bare-Metal Kernel Compiler
 bbc: bbc.c
@@ -12,6 +12,10 @@ bbc: bbc.c
 # 2. AMDGPU Zero-Copy Graphical Desktop OS (Linux Mint Cinnamon Edition + 20-Pkg Store)
 gpu_desktop: bbc os/gpu_desktop.bb os/gpu_vfs.bb os/gpu_mint_gui.h
 	./bbc os/gpu_desktop.bb -lX11 -lm -o gpu_desktop
+
+# 2b. 6-Pillar Architectural Superpowers & 1.58-Bit Ternary LLM Benchmark Suite
+superpowers: bbc os/superpowers.bb os/gpu_vfs.bb os/os_superpowers.h
+	./bbc os/superpowers.bb -lm -o superpowers
 
 # 3. AMDGPU Wavefront Scheduler & Benchmark OS Engine
 gpu_os: bbc os/gpu_os.bb os/gpu_vfs.bb
