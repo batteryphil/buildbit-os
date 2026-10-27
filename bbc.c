@@ -2705,6 +2705,9 @@ static void generate_runtime_header(FILE *out) {
         "#endif\n"
         "#if __has_include(\"os/os_superpowers.h\")\n"
         "#include \"os/os_superpowers.h\"\n"
+        "#endif\n"
+        "#if __has_include(\"os/falcon3_engine.h\")\n"
+        "#include \"os/falcon3_engine.h\"\n"
         "#endif\n\n");
 }
 

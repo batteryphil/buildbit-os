@@ -1,9 +1,9 @@
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -Werror
 
-.PHONY: all os gui_kernel gui_iso boot-mint-gpu boot-gpu-os boot-gui-iso boot-os compare-os test-20-packages superpowers clean
+.PHONY: all os gui_kernel gui_iso boot-mint-gpu boot-gpu-os boot-gui-iso boot-os compare-os test-20-packages superpowers falcon3_158bit clean
 
-all: bbc os gui_kernel gpu_os gpu_desktop superpowers
+all: bbc os gui_kernel gpu_os gpu_desktop superpowers falcon3_158bit
 
 # 1. Buildbit Systems & Bare-Metal Kernel Compiler
 bbc: bbc.c
@@ -16,6 +16,10 @@ gpu_desktop: bbc os/gpu_desktop.bb os/gpu_vfs.bb os/gpu_mint_gui.h
 # 2b. 6-Pillar Architectural Superpowers & 1.58-Bit Ternary LLM Benchmark Suite
 superpowers: bbc os/superpowers.bb os/gpu_vfs.bb os/os_superpowers.h
 	./bbc os/superpowers.bb -lm -o superpowers
+
+# 2c. Real 10.3B Ternary LLM Engine (tiiuae/Falcon3-10B-Instruct-1.58bit Zero-Unpack Engine)
+falcon3_158bit: bbc os/falcon3_158bit.bb os/gpu_vfs.bb os/falcon3_engine.h
+	./bbc os/falcon3_158bit.bb -lm -o falcon3_158bit
 
 # 3. AMDGPU Wavefront Scheduler & Benchmark OS Engine
 gpu_os: bbc os/gpu_os.bb os/gpu_vfs.bb
